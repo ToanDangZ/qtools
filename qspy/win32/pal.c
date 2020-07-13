@@ -64,6 +64,10 @@ static QSPYEvtType file_getEvt(unsigned char *buf, size_t *pBytes);
 static QSpyStatus  file_send2Target(unsigned char *buf, size_t nBytes);
 static void file_cleanup(void);
 
+static QSPYEvtType udp_getEvt(unsigned char* buf, size_t* pBytes);
+static QSpyStatus  udp_send2Target(unsigned char* buf, size_t nBytes);
+static void udp_cleanup(void);
+
 /* helper functions ........................................................*/
 static QSPYEvtType be_receive (unsigned char *buf, size_t *pBytes);
 static QSPYEvtType kbd_receive(unsigned char *buf, size_t *pBytes);
@@ -80,7 +84,13 @@ static int    l_beReturnAddrSize;
 static SOCKET l_serverSock = INVALID_SOCKET;
 static SOCKET l_clientSock = INVALID_SOCKET;
 
+static SOCKET l_udpSock = INVALID_SOCKET;
+
 static FILE *l_file = (FILE *)0;
+
+static const char* l_pUdpIpAddr = NULL;
+static int   l_udpPort = 777;     /* default UPP port to target */
+static int   l_udpLocalPort = 1777;
 
 /* PAL timeout determines how long to wait for an event [ms] */
 #define PAL_TOUT_MS 10
@@ -468,6 +478,170 @@ static QSpyStatus tcp_send2Target(unsigned char *buf, size_t nBytes) {
         return QSPY_ERROR;
     }
     return QSPY_SUCCESS;
+}
+
+/*==========================================================================*/
+/* Win32 UDP communication with the Target */
+
+QSpyStatus PAL_openTargetUdp(const char* ptrIpAddr, int port) {
+    struct sockaddr_in local;
+    //u_long sockmode;
+    WSADATA wsaData;
+
+    if (ptrIpAddr == NULL)
+    {
+        return QSPY_ERROR;
+    }
+    l_pUdpIpAddr = ptrIpAddr;
+    /* setup the PAL virtual table for UDP Target connection... */
+    /*FIXME: update these functions*/
+    PAL_vtbl.getEvt = &udp_getEvt;
+    PAL_vtbl.send2Target = &udp_send2Target;
+    PAL_vtbl.cleanup = &udp_cleanup;
+
+    /* itialize Windows sockets version 2.2)... */
+    /* WSAStartup() might be already called from PAL_openBE(), but
+    * in case the Back-End socket is not used it must be called here.
+    * NOTE: It's OK to call WSAStartup() multiple times, as long as
+    * the cleanup is performed equal number of times.
+    */
+    int wsaErr = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (wsaErr == SOCKET_ERROR) {
+        SNPRINTF_LINE("   <COMMS> ERROR    Init Windows Sockets Err=%d",
+            wsaErr);
+        QSPY_printError();
+        return QSPY_ERROR;
+    }
+
+    /* create UDP socket */
+    l_udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (l_udpSock == INVALID_SOCKET) {
+        SNPRINTF_LINE("   <COMMS> ERROR    Server socket create Err=%d",
+            WSAGetLastError());
+        QSPY_printError();
+        return QSPY_ERROR;
+    }
+
+    /* Set the socket to non-blocking mode */
+    ULONG ioctl_opt = 1;
+    if (ioctlsocket(l_udpSock, FIONBIO, &ioctl_opt) == SOCKET_ERROR) {
+        SNPRINTF_LINE("   <COMMS> ERROR    Server socket configuration Err = % d",
+            WSAGetLastError());
+        return QSPY_ERROR;
+    }
+
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = INADDR_ANY;
+    local.sin_port = htons((u_short)port);
+
+    // bind() associates a local address and port combination with the
+    // socket just created. This is most useful when the application is a
+    // server that has a well-known port that clients know about in advance.
+    if (bind(l_udpSock, (struct sockaddr*)&local, sizeof(local)) == SOCKET_ERROR)
+    {
+        SNPRINTF_LINE("   <COMMS> ERROR    Binding sever socket Err = % d",
+            WSAGetLastError());
+        return QSPY_ERROR;
+    }
+
+    return QSPY_SUCCESS;
+};
+
+static QSPYEvtType udp_getEvt(unsigned char* buf, size_t* pBytes) {
+    QSPYEvtType evt;
+    struct timeval timeout = { (long)0, (long)(PAL_TOUT_MS * 1000 * 5) }; /* wait 50ms*/
+    fd_set readSet;
+    int status;
+    int nrec;
+    //char client_hostname[128];
+
+    /* try to receive data from keyboard... */
+    evt = kbd_receive(buf, pBytes);
+    if (evt != QSPY_NO_EVT) {
+        return evt;
+    }
+
+    /* try to receive data from the Back-End socket... */
+    evt = be_receive(buf, pBytes);
+    if (evt != QSPY_NO_EVT) {
+        return evt;
+    }
+
+    /* still waiting for the client? */
+    if (l_udpSock == INVALID_SOCKET) {
+        SNPRINTF_LINE("   <COMMS> ERROR    UDP Socket is INVALID" );
+
+        /*FIXME: to see if it's necessary*/
+    }
+    else { /* client is connected... */
+        FD_ZERO(&readSet);
+        FD_SET(l_udpSock, &readSet);
+
+        /* selective, timed blocking... */
+        status = select(0, &readSet, (fd_set*)0, (fd_set*)0, &timeout);
+
+        if (status == SOCKET_ERROR) {
+            SNPRINTF_LINE("   <COMMS> ERROR    UDP socket select Err=%d",
+                WSAGetLastError());
+            QSPY_printError();
+            return QSPY_ERROR_EVT;
+        }
+        else if (FD_ISSET(l_udpSock, &readSet)) {
+            nrec = recv(l_udpSock, (char*)buf, (int)(*pBytes), 0);
+            if (nrec == SOCKET_ERROR) { /* UDP socket error */
+                SNPRINTF_LINE("   <COMMS> ERROR    UDP recv failed Err=%d"
+                    "Host=%s,Port=%d"
+                    "\n----------------------------------------------------------",
+                    WSAGetLastError(),
+                    l_pUdpIpAddr, 
+                    l_udpPort);
+                QSPY_printInfo();
+            }
+            else {
+                *pBytes = (size_t)nrec;
+                return QSPY_TARGET_INPUT_EVT;
+            }
+        }
+    }
+
+    return QSPY_NO_EVT;
+}
+
+static QSpyStatus  udp_send2Target(unsigned char* buf, size_t nBytes) {
+    if (l_udpSock == INVALID_SOCKET) {
+        return QSPY_ERROR;
+    }
+    struct hostent* remoteHost;
+    struct sockaddr_in targetAddr;
+    remoteHost = gethostbyname(l_pUdpIpAddr);
+    if (remoteHost == 0) {
+        SNPRINTF_LINE("   <COMMS> ERROR    gethostbyname Err=%d"
+            "Host: %s",
+            WSAGetLastError(),
+            l_pUdpIpAddr);
+        QSPY_printError();
+        return QSPY_ERROR;
+    }
+    memset(&targetAddr, 0, sizeof(targetAddr));
+    memcpy(&targetAddr.sin_addr, remoteHost->h_addr, remoteHost->h_length);
+    targetAddr.sin_family = AF_INET;
+    targetAddr.sin_port = htons((u_short)l_udpPort);
+    if (sendto(l_udpSock, (char*)buf, (int)nBytes, 0,
+        (struct sockaddr *)&targetAddr, sizeof(targetAddr)) == SOCKET_ERROR) {
+        SNPRINTF_LINE("   <COMMS> ERROR    Writing to UDP socket Err=%d",
+            WSAGetLastError());
+        QSPY_printError();
+        return QSPY_ERROR;
+    }
+    return QSPY_SUCCESS;
+}
+
+static void udp_cleanup(void) {
+    if (l_udpSock != INVALID_SOCKET) {
+        closesocket(l_udpSock);
+    }
+    WSACleanup();
 }
 
 /*==========================================================================*/

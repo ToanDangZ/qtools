@@ -53,6 +53,7 @@ void PAL_clearScreen(void);
 QSpyStatus PAL_openTargetSer(char const *comName, int baudRate);
 QSpyStatus PAL_openTargetTcp(int portNum);
 QSpyStatus PAL_openTargetFile(char const *fName);
+QSpyStatus PAL_openTargetUdp(const char* ptrIpAddr, int port);
 
 /* events for the QSPY event loop... */
 typedef enum {

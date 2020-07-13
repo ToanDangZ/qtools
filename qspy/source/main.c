@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <time.h>
+#include <WinSock2.h>
 
 #include "safe_std.h" /* "safe" <stdio.h> and <string.h> facilities */
 #include "qspy.h"     /* QSPY data parser */
@@ -57,7 +58,8 @@ typedef enum {
     NO_LINK,
     FILE_LINK,
     SERIAL_LINK,
-    TCP_LINK
+    TCP_LINK,
+    UDP_LINK
 } TargetLink;
 
 static TargetLink l_link = NO_LINK;
@@ -81,6 +83,10 @@ static char  l_tstampStr  [16];
 static int   l_bePort   = 7701;   /* default UDP port  */
 static int   l_tcpPort  = 6601;   /* default TCP port */
 static int   l_baudRate = 115200; /* default serial baudrate */
+static int   l_udpPort = 777;     /* default UPP port to target */
+static int   l_udpLocalPort = 1777;
+static char  l_udpIpAddr[FNAME_SIZE];
+
 
 static char const l_introStr[] =
     "QSPY %s Copyright (c) 2005-2020 Quantum Leaps\n"
@@ -102,6 +108,7 @@ static char const l_helpStr[] =
     "-m                        produce Matlab output to a file\n"
     "-g                        produce MscGen output to a file\n"
     "-t [TCP_port]     6601    TCP/IP input with optional port\n"
+    "-p [UDP_port]     777     UDP input with optional port\n"
 #ifdef _WIN32
     "-c <COM_port>     COM1    com port input (default)\n"
 #elif (defined __linux) || (defined __linux__) || (defined __posix)
@@ -143,7 +150,6 @@ static QSpyStatus configure(int argc, char *argv[]);
 static void cleanup(void);
 static char const *tstampStr(void);
 static uint8_t l_buf[8*1024]; /* process input in 8K chunks */
-
 /*..........................................................................*/
 int main(int argc, char *argv[]) {
     int status = 0;
@@ -429,10 +435,18 @@ static QSpyStatus configure(int argc, char *argv[]) {
                 l_link = TCP_LINK;
                 break;
             }
-            case 'p': { /* TCP/IP port number */
-                FPRINTF_S(stderr,
-                        "The -p option is obsolete, use -t[port]\n");
-                return QSPY_ERROR;
+            case 'p': { /* UDP port number */
+                if ((l_link != NO_LINK) && (l_link != UDP_LINK)) {
+                    FPRINTF_S(stderr,
+                        "The -t option is incompatible with -c/-b/-f\n");
+                    return QSPY_ERROR;
+                }
+                if (optarg != NULL) { /* is optional argument provided?*/
+
+                    STRCPY_S(l_udpIpAddr, sizeof(l_udpIpAddr), optarg); 
+                }
+                PRINTF_S("-p %s %d\n", l_udpIpAddr, l_udpPort);
+                l_link = UDP_LINK;
                 break;
             }
             case 'T': { /* timestamp size */
@@ -517,6 +531,12 @@ static QSpyStatus configure(int argc, char *argv[]) {
         }
         case FILE_LINK: {   /* input QS data from a file */
             if (PAL_openTargetFile(l_inpFileName) != QSPY_SUCCESS) {
+                return QSPY_ERROR;
+            }
+            break;
+        }
+        case UDP_LINK: { /* connect to the Target via UDP socket */
+            if (PAL_openTargetUdp(l_udpIpAddr , l_udpLocalPort) != QSPY_SUCCESS) {
                 return QSPY_ERROR;
             }
             break;
